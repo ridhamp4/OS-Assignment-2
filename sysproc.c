@@ -6,6 +6,13 @@
 #include "mmu.h"
 #include "proc.h"
 #include "pstat.h"
+#include "spinlock.h"
+
+// Access the global process table defined in proc.c
+extern struct {
+    struct spinlock lock;
+    struct proc proc[NPROC];
+} ptable;
 
 int sys_fork(void)
 {
