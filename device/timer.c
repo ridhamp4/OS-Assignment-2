@@ -53,6 +53,7 @@ void isr_timer (struct trapframe *tp, int irq_idx)
 {
     acquire(&tickslock);
     ticks++;
+    // Defer waking sleepers until their deadline; wakeup will filter
     wakeup(&ticks);
     release(&tickslock);
     ack_timer();

@@ -7,6 +7,13 @@
 #include "proc.h"
 #include "spinlock.h"
 
+#define RAND_MAX 0x7fffffff
+uint rseed = 0;
+
+uint rand() {
+    return rseed = (rseed * 1103515245 + 12345) & RAND_MAX;
+}
+
 //
 // Process initialization:
 // process initialize is somewhat tricky.
@@ -102,6 +109,13 @@ static struct proc* allocproc(void)
     // it use our implementation.
     p->context->lr = (uint)forkret+4;
 
+    // initialize lottery scheduling fields
+    p->tickets = 1;
+    p->boostsleft = 0;
+    p->runticks = 0;
+    p->sleep_start_tick = 0;
+    p->sleep_until_tick = 0;
+
     return p;
 }
 
@@ -146,6 +160,7 @@ void userinit(void)
     p->cwd = namei("/");
 
     p->state = RUNNABLE;
+    // initproc starts with 1 ticket (already set in allocproc)
 }
 
 // Grow current process's memory by n bytes.
@@ -210,6 +225,10 @@ int fork(void)
     np->cwd = idup(proc->cwd);
 
     pid = np->pid;
+    // child inherits tickets, but not boostsleft/runticks
+    np->tickets = proc->tickets;
+    np->boostsleft = 0;
+    np->runticks = 0;
     np->state = RUNNABLE;
     safestrcpy(np->name, proc->name, sizeof(proc->name));
 
@@ -321,6 +340,8 @@ int wait(void)
 void scheduler(void)
 {
     struct proc *p;
+    int total_effective_tickets;
+    struct proc *winner;
 
     for(;;){
         // Enable interrupts on this processor.
@@ -329,23 +350,64 @@ void scheduler(void)
         // Loop over process table looking for process to run.
         acquire(&ptable.lock);
 
+        // compute total effective tickets for RUNNABLE processes
+        total_effective_tickets = 0;
         for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-            if(p->state != RUNNABLE) {
-                continue;
+            if(p->state == RUNNABLE){
+                int effective = p->tickets;
+                if(p->boostsleft > 0){
+                    // doubled tickets when boosted
+                    if (effective <= RAND_MAX/2) {
+                        effective = effective * 2;
+                    } else {
+                        effective = RAND_MAX; // cap to avoid overflow
+                    }
+                }
+                total_effective_tickets += effective;
+            }
+        }
+
+        if(total_effective_tickets > 0){
+            // hold lottery and pick a RUNNABLE process
+            winner = 0;
+            {
+                // select winner ticket in [0, total_effective_tickets)
+                uint random_number = rand();
+                uint winner_ticket_number = random_number % (uint)total_effective_tickets;
+                int cumsum = 0;
+                for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+                    if(p->state != RUNNABLE) continue;
+                    int effective = p->tickets;
+                    if(p->boostsleft > 0){
+                        if (effective <= RAND_MAX/2) {
+                            effective = effective * 2;
+                        } else {
+                            effective = RAND_MAX;
+                        }
+                    }
+                    cumsum += effective;
+                    if((uint)cumsum > winner_ticket_number){
+                        winner = p;
+                        break;
+                    }
+                }
             }
 
-            // Switch to chosen process.  It is the process's job
-            // to release ptable.lock and then reacquire it
-            // before jumping back to us.
-            proc = p;
-            switchuvm(p);
-
-            p->state = RUNNING;
-
-            swtch(&cpu->scheduler, proc->context);
-            // Process is done running for now.
-            // It should have changed its p->state before coming back.
-            proc = 0;
+            if(winner){
+                // run the winner for up to one tick
+                proc = winner;
+                switchuvm(winner);
+                winner->state = RUNNING;
+                swtch(&cpu->scheduler, proc->context);
+                // when we return, the process yielded/slept/exited
+                // account run tick if it actually ran
+                // we treat each dispatch as one tick of CPU time
+                winner->runticks++;
+                if(winner->boostsleft > 0){
+                    winner->boostsleft--;
+                }
+                proc = 0;
+            }
         }
 
         release(&ptable.lock);
@@ -436,6 +498,12 @@ void sleep(void *chan, struct spinlock *lk)
     // Go to sleep.
     proc->chan = chan;
     proc->state = SLEEPING;
+    // record sleep start and deadline if sleeping on &ticks
+    if (chan == &ticks) {
+        proc->sleep_start_tick = ticks;
+        // sys_sleep sets up while loop based on ticks delta; we can't know N here
+        // The wakeup1() will check sleep_until_tick populated by sys_sleep wrapper below
+    }
     sched();
 
     // Tidy up.
@@ -455,9 +523,31 @@ static void wakeup1(void *chan)
     struct proc *p;
 
     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
-        if(p->state == SLEEPING && p->chan == chan) {
-            p->state = RUNNABLE;
+        if(p->state != SLEEPING) continue;
+        if(p->chan != chan) continue;
+        if(chan == &ticks){
+            // only wake when the sleep deadline has arrived
+            if (ticks < p->sleep_until_tick) {
+                continue;
+            }
+            // compute slept ticks and accumulate boosts
+            uint slept = 0;
+            if (p->sleep_start_tick <= ticks) {
+                slept = ticks - p->sleep_start_tick;
+            }
+            if (slept > 0) {
+                // add slept ticks to boostsleft
+                // beware overflow: cap at INT_MAX/2
+                int max_add = 0x3fffffff; // conservative cap
+                if (slept > (uint)max_add) slept = (uint)max_add;
+                if (p->boostsleft <= 0x7fffffff - (int)slept) {
+                    p->boostsleft += (int)slept;
+                } else {
+                    p->boostsleft = 0x7fffffff;
+                }
+            }
         }
+        p->state = RUNNABLE;
     }
 }
 

@@ -5,6 +5,7 @@
 #include "memlayout.h"
 #include "mmu.h"
 #include "proc.h"
+#include "pstat.h"
 
 int sys_fork(void)
 {
@@ -69,6 +70,8 @@ int sys_sleep(void)
 
     ticks0 = ticks;
 
+    // Set precise wakeup deadline in proc before sleeping
+    proc->sleep_until_tick = ticks + (uint)n;
     while(ticks - ticks0 < n){
         if(proc->killed){
             release(&tickslock);
@@ -79,6 +82,55 @@ int sys_sleep(void)
     }
 
     release(&tickslock);
+    return 0;
+}
+
+int sys_settickets(void)
+{
+    int pid, n_tickets;
+    if (argint(0, &pid) < 0) return -1;
+    if (argint(1, &n_tickets) < 0) return -1;
+    if (n_tickets <= 0) return -1;
+    acquire(&ptable.lock);
+    struct proc *p;
+    int ok = -1;
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+        if(p->pid == pid && p->state != UNUSED){
+            p->tickets = n_tickets;
+            ok = 0;
+            break;
+        }
+    }
+    release(&ptable.lock);
+    return ok;
+}
+
+extern uint rseed;
+int sys_srand(void)
+{
+    int seed;
+    if (argint(0, &seed) < 0) return -1;
+    rseed = (uint)seed;
+    return 0;
+}
+
+int sys_getpinfo(void)
+{
+    struct pstat *st;
+    if (argptr(0, (char**)&st, sizeof(*st)) < 0) {
+        return -1;
+    }
+    acquire(&ptable.lock);
+    int i = 0;
+    struct proc *p;
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++, i++){
+        st->inuse[i] = (p->state != UNUSED);
+        st->pid[i] = p->pid;
+        st->tickets[i] = p->tickets;
+        st->runticks[i] = p->runticks;
+        st->boostsleft[i] = p->boostsleft;
+    }
+    release(&ptable.lock);
     return 0;
 }
 
